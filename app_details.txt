@@ -1,0 +1,849 @@
+# External Window Resizer — Development Specification
+
+## 1. Objective
+
+Build a Windows 10/11 application in C#/.NET 8 with ImGui.NET that can enumerate top-level windows belonging to other running processes and resize a selected external window to a selected resolution.
+
+The target application does not need to be modified. The implementation must use Win32 window handles (`HWND`) and native Win32 APIs through P/Invoke.
+
+The application must support two resize interpretations:
+
+- **Window** — the selected resolution applies to the complete outer window.
+- **Content Area** — the selected resolution applies to the Win32 client area. The application automatically makes the outer window larger as necessary to accommodate the Windows title bar, borders, and other non-client chrome.
+
+Example: if `800 x 600` is selected and **Content Area** is active, `GetClientRect()` for the target window should end up at exactly `800 x 600`. The complete external window will normally be somewhat larger.
+
+Settings must be saved alongside the app in `application_settings.json`. Save the resolution list, the selected `Apply resolution to:` radio mode (`Window` or `Content Area`), and the light/dark theme choice. Do not persist the selected external window, selected resolution, or window filter.
+
+---
+
+## 2. Main UI Concepts
+
+The main window contains at least:
+
+1. A **window list** containing currently detected external top-level windows.
+2. A **resolution list** containing resolutions that can be applied.
+3. The label **`Apply resolution to:`** followed by mutually exclusive radio buttons for the two sizing modes.
+4. A **`Set Resolution`** button with an action/gear icon above its text.
+5. A filter textbox, clear-filter brush icon button, and three-arrow recycle-style refresh icon button above the window list.
+6. Icon-only **Add** (plus), **Edit** (pen), and **Delete** (trashcan) buttons for resolutions. Add and Edit use the dialog shown in `002_ResolutionAddEditWindowV2.png`.
+7. A diagnostics log and the status line at the bottom.
+8. Custom minimize, maximize/restore, and close buttons at the top right of the in-app header. The native Windows title bar, border, and control box are absent.
+9. A moon/sun theme button at the bottom right of the status line.
+
+Use `001_MainWindowV2.png` for the main window layout and `002_ResolutionAddEditWindowV2.png` for the resolution dialog layout. Explicit behavioral and icon requirements in this specification take precedence where a mockup still depicts older text buttons or window entry text.
+
+The main window has group boxes titled **`Windows list`**, **`Resolutions`**, and **`Diagnostics`**. The first two contain their respective controls; the Diagnostics group contains the read-only multiline log. Keep the status line below the groups and preserve its behavior.
+
+---
+
+## 3. Window List
+
+### 3.1 Enumeration
+
+Use `EnumWindows()` to enumerate top-level windows.
+
+For each candidate, obtain as appropriate:
+
+- `IsWindowVisible()`
+- `GetWindowText()` / `GetWindowTextLength()`
+- `GetClassName()`
+- `GetWindowThreadProcessId()`
+- owning process information via `Process.GetProcessById()`
+
+At minimum, exclude:
+
+- invisible windows,
+- windows with no valid owning process,
+- this application's own main window.
+
+The implementation must not assume one process has only one top-level window.
+
+The window list must not contain the same `HWND` more than once. Separate `HWND`s must remain separate entries even when they have the same process name, title (after trimming whitespace), and PID; the displayed HWND distinguishes them. Sort the final list alphabetically by process name (case-insensitive), then by numeric PID; use title and `HWND` as deterministic tie-breakers.
+
+### 3.2 Display format
+
+Where the window title can be fetched, display the entry using this format:
+
+```text
+process_name - Window Title - process_pid - HWND 0xHANDLE
+```
+
+Example:
+
+```text
+notepad - Document.txt - Notepad - 12480 - HWND 0x000C183A
+```
+
+If the window title cannot be fetched, or it is empty/whitespace, display:
+
+```text
+process_name - process_pid - HWND 0xHANDLE
+```
+
+Example:
+
+```text
+notepad - 12480 - HWND 0x000C183A
+```
+
+The final identifier is the retained Win32 `HWND` in hexadecimal, prefixed with `0x` and at least eight digits. It is displayed for identification; internally the selected window must also retain its actual `HWND`, PID, process name, title and class name as available.
+
+Do not identify or later re-find the selected target solely by its window title because titles may change.
+
+### 3.3 Filtering and refresh
+
+Place a filter textbox directly above the window list. When empty and unfocused, it displays the placeholder **`Filter`** in gray. On focus by mouse or Tab, typing starts normal black text; the placeholder is not part of the query. If focus leaves an empty textbox, show the gray placeholder again.
+
+Filter the currently enumerated window entries as the query changes. Keep only rows whose process name or window title contains the query, using case-insensitive substring matching. Do not search PID or HWND text. An empty query shows all enumerated entries. Filtering only changes visibility in the list; it does not delete windows or change the underlying enumeration. If the selected window is hidden by the filter, clear that selection and disable Set Resolution until a visible window is selected.
+
+Place an icon-only brush button next to the textbox with tooltip **`Clear filter`**. Clicking it clears the query and shows all enumerated entries. Place an icon-only three-arrow recycle-style refresh button next to it with tooltip **`Refresh window list`**. Refresh re-enumerates external windows and reapplies any active filter. The refresh button's right edge must align with the right edge of the window-list control below; it must not spill beyond it. Each icon button is 34 x 31 ImGui units, and the filter reserves both button widths plus both horizontal item gaps (`2 * 34 + 2 * style.ItemSpacing.X`).
+
+### 3.4 Selection behavior
+
+The window list is strictly **single-selection**.
+
+- At most one external window may be selected at a time.
+- Selecting another entry automatically deselects the previous entry.
+- Multi-select behavior must be disabled in the UI control.
+- The selected item's `HWND` is the authoritative target for resize and bring-to-front operations.
+
+### 3.5 Double-click behavior
+
+Double-clicking an entry in the window list must attempt to bring that external window to the front.
+
+ImGui's built-in double-click flag is not enough for this app's row interaction. Register every left click after drawing each selectable row. Recognize a double-click only when the same HWND is clicked twice within `GetDoubleClickTime()` and within 12 pixels of the first click; consume the pair after activation. A first click only selects. A second qualifying click selects and calls the bring-to-front command.
+
+Expected behavior:
+
+1. Validate the stored handle with `IsWindow(hwnd)`.
+2. If the target is minimized, use `ShowWindow(hwnd, SW_RESTORE)` and verify with `IsIconic()` that it is no longer minimized before requesting foreground activation.
+3. Attempt to activate/bring the window to the foreground using appropriate Win32 APIs, primarily `SetForegroundWindow()` and, where useful, `BringWindowToTop()`.
+4. Do not resize the window as part of this operation.
+
+Windows has foreground-activation restrictions, so a failure to take focus must be handled without crashing. Log/report a meaningful failure where appropriate.
+
+---
+
+## 4. Resolution List
+
+The resolution list contains the resolutions available for application to the selected target window. Users can add, edit, and delete entries. Each item must have a positive integer width and height.
+
+On first launch, before `application_settings.json` exists, populate the list with these default resolutions, starting at 800 x 600 and ending at 4K (3840 x 2160):
+
+```text
+800 x 600
+1024 x 768
+1280 x 720
+1920 x 1080
+1920 x 1200
+2560 x 1440
+3840 x 2160
+```
+
+The resolution list is persisted in `application_settings.json`. On later launches, load the saved list, including an empty list if the user deleted every entry. Do not silently restore defaults when a saved empty list exists.
+
+Sort resolutions by the numeric x value (width) in ascending order. When widths match, sort by numeric y value (height) in ascending order. Apply this order to defaults, loaded settings, added resolutions, and edited resolutions. The saved list must not contain duplicate width/height pairs; normalize older saved lists if necessary.
+
+### 4.1 Resolution management
+
+The resolution list's Add, Edit, and Delete buttons are icon-only: plus, pen, and trashcan respectively. Their tooltips are **`Add resolution`**, **`Edit resolution`**, and **`Delete resolution`**. Edit and Delete are disabled when no resolution is selected.
+
+- **Add** opens the `002_ResolutionAddEditWindowV2.png` dialog with width and height inputs. Saving a valid entry adds it to the resolution list.
+- **Edit** opens the same dialog with the selected resolution's current width and height. Saving valid changes updates that entry.
+- **Delete** removes the selected resolution from the list.
+- **Add** must refuse a width/height pair already in the list. **Edit** must refuse changing an entry to the same width/height pair as another entry. Show a useful validation message while keeping the dialog open.
+- Compare width and height in their entered order: `800 x 600` and `600 x 800` are different resolutions and both are allowed.
+- Edit and Delete require a selected resolution. Canceling the Add/Edit dialog leaves the list unchanged.
+- Reject non-positive or non-integer dimensions and report validation errors in the dialog.
+- Persist changes to the resolution list in `application_settings.json`.
+
+The Add/Edit dialog has a group box titled **`Resolution`** around both numeric inputs and their separator. Make the width and height numeric controls large, with prominently enlarged numerals and usable spin arrows, following the V2 mockup. Keep the existing Cancel and Save actions and validation behavior.
+
+### 4.2 Selection behavior
+
+The resolution list is strictly **single-selection**.
+
+- At most one resolution may be selected at a time.
+- Selecting another resolution automatically deselects the previous resolution.
+- Multi-select behavior must be disabled in the UI control.
+
+### 4.3 Double-click behavior
+
+Double-clicking a resolution must perform exactly the same application command as clicking **`Set Resolution`**.
+
+Use the same explicit per-row click tracker as the window list, keyed by the ordered width/height pair. The second qualifying left click updates selection and calls `ApplySelectedResolution()` immediately; do not depend solely on ImGui's `AllowDoubleClick` return value.
+
+Do not implement separate resize logic for the double-click handler. Both interactions must call the same command/method so their validation and behavior cannot diverge.
+
+Conceptually:
+
+```text
+Resolution double-click ─┐
+                        ├──> ApplySelectedResolution()
+Set Resolution button ──┘
+```
+
+If no target window is currently selected, double-clicking a resolution cannot perform a resize and must be handled safely. The same applies when the window list is empty or the resolution list is empty. The UI should preferably prevent/disable an unavailable command rather than produce an exception.
+
+---
+
+## 5. `Apply resolution to:` Radio Buttons
+
+The UI contains the exact label:
+
+```text
+Apply resolution to:
+```
+
+Immediately associated with it are two mutually exclusive radio buttons for these sizing modes:
+
+```text
+Window
+Content Area
+```
+
+Place the label and both options on one horizontal line. Align the label to the controls' vertical center with `AlignTextToFramePadding()`. Separate the label and options by 16 ImGui units. Render each option as a 20-unit white circle with a 2-unit dark blue-gray outline; the selected circle contains a prominent 5.5-unit-radius blue dot. Place its text 7 units after the circle and vertically center it within a frame-height click target. Only one option may be selected.
+
+### 5.1 Default
+
+**`Window` is the default selection on first launch, before saved settings exist.** On later launches, restore the saved `Apply resolution to:` radio selection.
+
+Unless the user changes the radio selection, selecting `800 x 600` and applying the resolution therefore makes the complete outer target window `800 x 600`.
+
+### 5.2 `Window` behavior
+
+When **Window** is selected, the chosen resolution applies to the complete outer window rectangle.
+
+For example:
+
+```text
+Selected resolution: 800 x 600
+Apply resolution to: Window
+```
+
+Target result:
+
+```text
+GetWindowRect width  = 800
+GetWindowRect height = 600
+```
+
+Use `SetWindowPos()` to request the selected width and height for the target HWND.
+
+Use flags such as:
+
+- `SWP_NOMOVE`
+- `SWP_NOZORDER`
+- `SWP_NOACTIVATE`
+
+when appropriate so setting a resolution does not unexpectedly move the target, alter its Z-order, or steal focus.
+
+The target application's actual content/client area will be smaller than the selected resolution because the outer `800 x 600` includes title bar, borders, and other non-client chrome.
+
+### 5.3 `Content Area` behavior
+
+When **Content Area** is selected, the chosen resolution applies to the target's Win32 client area rather than to the complete outer window.
+
+For example:
+
+```text
+Selected resolution: 800 x 600
+Apply resolution to: Content Area
+```
+
+Target result:
+
+```text
+GetClientRect width  = 800
+GetClientRect height = 600
+```
+
+The application must automatically make the complete outer window larger to allow for its title bar, borders and other non-client chrome.
+
+Do not hard-code title-bar or border dimensions. These vary with Windows version, DPI, theme and window style.
+
+Use the target window's measured outer/client difference.
+
+First obtain the current outer size using `GetWindowRect()`:
+
+```text
+currentOuterWidth
+currentOuterHeight
+```
+
+Then obtain its client size using `GetClientRect()`:
+
+```text
+currentClientWidth
+currentClientHeight
+```
+
+For requested client dimensions, calculate:
+
+```text
+newOuterWidth =
+    currentOuterWidth +
+    (requestedClientWidth - currentClientWidth)
+
+newOuterHeight =
+    currentOuterHeight +
+    (requestedClientHeight - currentClientHeight)
+```
+
+Then call `SetWindowPos()` with the calculated outer size.
+
+Example:
+
+```text
+Current outer:      1016 x 689
+Current client:     1000 x 650
+Requested client:    800 x 600
+
+Calculated outer:    816 x 639
+```
+
+The resulting complete window should therefore become approximately `816 x 639`, while its content/client area becomes exactly `800 x 600`.
+
+After resizing, call `GetClientRect()` again and verify the result. If the result differs from the requested size, adjust the outer size by the remaining difference and retry. Limit correction attempts to a small number such as 3; never create an unbounded resize loop.
+
+Important semantic note: **Content Area means the Win32 client area returned by `GetClientRect()`**. Application-owned child UI such as a custom status bar may itself occupy part of this client area and is not generically detectable as separate semantic content.
+
+---
+
+## 6. `Set Resolution` Command
+
+A resolution is applied by clicking the **`Set Resolution`** button when:
+
+1. exactly one window is selected in the window list, and
+2. exactly one resolution is selected in the resolution list.
+
+The command must use the currently selected **`Apply resolution to:`** radio button to decide how to interpret the selected resolution.
+
+The logic is therefore:
+
+```text
+Selected window
+      +
+Selected resolution
+      +
+Apply resolution to
+      |
+      v
+ApplySelectedResolution()
+      |
+      +--> Window       -> resize complete outer window
+      |
+      +--> Content Area -> resize so GetClientRect equals selected resolution
+```
+
+If either the window or the resolution is not selected, or either list is empty, the operation must not run.
+
+Prefer disabling the **`Set Resolution`** button until both required selections exist. Regardless of button enabled state, the underlying command must still validate its inputs defensively.
+
+Before performing a resize:
+
+1. Validate `width > 0` and `height > 0`.
+2. Validate the selected `HWND` using `IsWindow()`.
+3. Restore the target to its normal (neither minimized nor maximized) state before measuring or sizing it. Verify the state with `IsIconic()` and `IsZoomed()`; a minimized window may need a second restore if it first returns to maximized. Stop with a useful error if restoration does not succeed.
+4. Apply the selected resolution according to the selected radio mode.
+5. Verify the resulting relevant dimensions.
+6. Report/log inability to achieve the requested size if the target application enforces its own size restrictions.
+
+---
+
+## 7. Interaction Summary
+
+| User action | Required behavior |
+|---|---|
+| Single-click window | Select that window and deselect any previously selected window |
+| Double-click window | Select it and bring that external window to the front |
+| Single-click resolution | Select that resolution and deselect any previously selected resolution |
+| Double-click resolution | Perform the same command as `Set Resolution` |
+| `Apply resolution to: Window` | Chosen dimensions apply to the complete outer window |
+| `Apply resolution to: Content Area` | Chosen dimensions apply to `GetClientRect()`; enlarge outer window automatically for non-client chrome |
+| Click `Set Resolution` | Apply selected resolution to selected window using the selected mode |
+| Type in Filter | Immediately show only window entries whose process name or title contains the query, case-insensitively |
+| Click brush icon | Clear the filter and show all enumerated windows |
+| Click refresh icon | Re-enumerate external top-level windows and reapply the current filter |
+| Add/Edit resolution | Open the `002_ResolutionAddEditWindowV2.png` dialog and save valid dimensions to the resolution list |
+| Delete resolution | Remove the selected resolution from the list |
+| Empty window or resolution list | Prevent the resize command from running |
+
+---
+
+## 8. DPI Awareness
+
+The application must be DPI aware, preferably Per-Monitor DPI Awareness V2.
+
+This is required because Windows can otherwise virtualize coordinates and sizes at scaling values such as 125%, 150% and 200%.
+
+Do not fix DPI behavior using arbitrary scale factors. Configure appropriate Windows/.NET DPI awareness and ensure that dimensions read from and written to the Win32 APIs use a consistent coordinate system.
+
+Test with multiple monitors and different DPI/scaling values where possible.
+
+---
+
+## 9. Window State and Validity
+
+An `HWND` is not permanent. The target application may close, restart, destroy its top-level window, or replace it with another window.
+
+Validate a retained target with `IsWindow()` before acting on it.
+
+Use appropriate state APIs such as:
+
+- `IsIconic()`
+- `IsZoomed()`
+- `ShowWindow(hwnd, SW_RESTORE)`
+
+when required. Before resizing, a minimized or maximized target must reach normal state; verify this before taking dimensions or calling `SetWindowPos()`. Before bringing a minimized target to the front, verify that it is no longer minimized. Do not interpret `ShowWindow()`'s return value as proof that restoration succeeded.
+
+If the selected target no longer exists, do not crash. Tell the user that the target window is no longer available and allow the window list to be refreshed.
+
+---
+
+## 10. External Window Service
+
+Keep Win32 behavior separate from UI event handlers.
+
+Suggested structure:
+
+```text
+WindowInfo.cs
+ResolutionInfo.cs
+WindowDimensions.cs
+ExternalWindowService.cs
+NativeMethods.cs
+```
+
+Suggested service API:
+
+```csharp
+public sealed class ExternalWindowService
+{
+    public IReadOnlyList<WindowInfo> GetWindows();
+
+    public WindowDimensions GetDimensions(IntPtr hwnd);
+
+    public void BringToFront(IntPtr hwnd);
+
+    public void ResizeOuterWindow(
+        IntPtr hwnd,
+        int width,
+        int height);
+
+    public void ResizeClientArea(
+        IntPtr hwnd,
+        int clientWidth,
+        int clientHeight);
+
+    public void MoveWindow(
+        IntPtr hwnd,
+        int x,
+        int y);
+}
+```
+
+The UI/ViewModel should have one shared application command such as:
+
+```csharp
+ApplySelectedResolution()
+```
+
+Both the **`Set Resolution`** button and a resolution-list double-click must invoke this same command.
+
+---
+
+## 11. Required Win32 APIs
+
+Centralize native declarations in `NativeMethods`.
+
+At minimum, include the required declarations/types/constants for:
+
+- `EnumWindows`
+- `IsWindow`
+- `IsWindowVisible`
+- `GetWindowText`
+- `GetWindowTextLength`
+- `GetClassName`
+- `GetWindowThreadProcessId`
+- `GetWindowRect`
+- `GetClientRect`
+- `SetWindowPos`
+- `IsIconic`
+- `IsZoomed`
+- `ShowWindow`
+- `SetForegroundWindow`
+- `BringWindowToTop`
+
+Create the native `RECT` structure and required constants.
+
+Use `SetLastError = true` where appropriate and convert native failures into useful diagnostics/results.
+
+Do not implement resizing by simulating mouse dragging, keyboard shortcuts or pointer input. The primary resize mechanism is `SetWindowPos()`.
+
+---
+
+## 12. Target-Imposed Restrictions
+
+Some external applications enforce:
+
+- minimum window size,
+- maximum window size,
+- fixed aspect ratio,
+- application-specific sizing rules,
+- custom responses to `WM_SIZE`.
+
+Therefore a successful `SetWindowPos()` request does not guarantee the final dimensions equal the requested dimensions.
+
+Always measure the result after resizing.
+
+When the application cannot achieve the requested result, report actual versus requested dimensions rather than silently claiming success.
+
+Example:
+
+```text
+Requested client size: 800 x 600
+Actual client size:    800 x 584
+
+The target application prevented the requested size.
+```
+
+---
+
+## 13. Permissions
+
+Windows integrity/UIPI restrictions may affect interaction with a process running at a higher privilege level.
+
+Do not automatically elevate this application or attempt to bypass Windows security mechanisms.
+
+If a Win32 operation fails, surface useful diagnostics. Where appropriate indicate that the target application may be running at a different/higher privilege level.
+
+---
+
+## 14. Logging
+
+Display diagnostics in the **`Diagnostics`** group box in the main window. Preserve the existing read-only multiline log behavior and contents.
+
+Add lightweight diagnostics for at least:
+
+```text
+Selected HWND
+Target PID
+Target process name
+Current outer dimensions
+Current client dimensions
+Selected resolution
+Apply resolution to mode
+Calculated outer dimensions
+SetWindowPos result
+Final outer dimensions
+Final client dimensions
+Bring-to-front attempts/results
+```
+
+Example for Content Area mode:
+
+```text
+Target HWND: 0x000C183A
+Target: notepad - 12480
+Current outer: 1016x689
+Current client: 1000x650
+Requested client: 800x600
+Calculated outer: 816x639
+SetWindowPos: success
+Final client: 800x600
+```
+
+---
+
+## 15. Testing
+
+Test at least against several ordinary Windows applications such as Notepad, File Explorer, VLC and another .NET application.
+
+### Selection tests
+
+- Verify only one window can be selected at a time.
+- Verify only one resolution can be selected at a time.
+- Verify selecting another item replaces the prior selection.
+- Verify `Set Resolution` cannot execute without both selections.
+- Verify `Set Resolution` cannot execute when either list is empty.
+
+### Resolution management and settings
+
+- On first launch, verify the seven default resolutions from 800 x 600 through 3840 x 2160 and `Window` mode are shown.
+- Add a resolution through `002_ResolutionAddEditWindowV2.png` and verify it appears in the list and survives restart.
+- Edit a resolution through the same dialog and verify the updated dimensions survive restart.
+- Delete a resolution and verify it remains deleted after restart.
+- Delete every resolution, restart, and verify the list remains empty and resizing is unavailable.
+- Change the `Apply resolution to:` radio selection, restart, and verify that selection is restored.
+- Verify the selected window and selected resolution are not restored from settings.
+- Verify the large numeric inputs remain readable and usable at different DPI scales.
+- Verify adding an existing width/height pair is refused and editing to another entry's pair is refused, while editing an entry without changing its dimensions remains valid.
+- Verify `800 x 600` and `600 x 800` can coexist and that resolutions sort by width, then height, after loading, adding, and editing.
+
+### Window-list double click
+
+- Double-click a normal external window and confirm it is brought to the front.
+- Double-click a minimized window and confirm it is un-minimized before the foreground attempt.
+- Close a selected external window and confirm a later double-click fails safely.
+- Verify a minimized and a maximized window are restored to normal state before resizing. Include a window minimized from maximized state.
+
+### Resolution-list double click
+
+- Select one window and one resolution.
+- Double-click the resolution.
+- Confirm the result is identical to clicking `Set Resolution`.
+- Confirm the same `ApplySelectedResolution()` logic is used for both interactions.
+
+### Window mode
+
+Set:
+
+```text
+Apply resolution to: Window
+Resolution: 800 x 600
+```
+
+Verify the outer rectangle is `800 x 600` subject to restrictions imposed by the target application.
+
+### Content Area mode
+
+Set:
+
+```text
+Apply resolution to: Content Area
+Resolution: 800 x 600
+```
+
+Verify:
+
+```text
+GetClientRect() == 800 x 600
+```
+
+and confirm the complete outer window is larger as necessary for title bar/borders.
+
+Repeat with resolutions including:
+
+```text
+1280 x 720
+1920 x 1080
+1920 x 1200
+```
+
+### Window title fallback
+
+Verify display formatting:
+
+```text
+process_name - Window Title - pid - HWND 0xHANDLE
+```
+
+and, for a window with no retrievable title:
+
+```text
+process_name - pid - HWND 0xHANDLE
+```
+
+Verify the displayed hexadecimal HWND matches the retained handle. Verify the same HWND never appears twice, different HWNDs remain separate even when process/title/PID match, and entries sort by process name (case-insensitive) then numeric PID.
+
+### Main window UI and filter
+
+- Verify the Windows list, Resolutions, and Diagnostics group boxes match the V2 layout and the status bar remains present.
+- Verify gray `Filter` placeholder text is not treated as a query; keyboard and mouse focus allow normal black input.
+- Verify filtering matches process names and window titles case-insensitively, hides nonmatches as the query changes, and does not match only PID or HWND.
+- Verify the brush icon clears the filter and refresh re-enumerates while preserving the current query; check the refresh tooltip.
+- Verify the icon-only Add, Edit, and Delete buttons have their respective tooltips and actions.
+- Verify the Set Resolution button displays an action/gear icon above its text.
+
+### DPI
+
+Test at least 100%, 125% and 150% scaling where possible, including a multi-monitor scenario.
+
+---
+
+## 16. Definition of Done
+
+The feature is complete when all of the following are true:
+
+1. Visible external top-level windows can be enumerated.
+2. Window entries use `process_name - Window Title - process_pid - HWND 0xHANDLE` when a title is available.
+3. Entries fall back to `process_name - process_pid - HWND 0xHANDLE` when a title is unavailable.
+4. The window list permits only one selection.
+5. Double-clicking a window attempts to bring that window to the front.
+6. The resolution list permits only one selection.
+7. Double-clicking a resolution executes the same command as `Set Resolution`.
+8. `Set Resolution` only operates when a window and a resolution are selected.
+9. The UI contains `Apply resolution to:` with two mutually exclusive radio buttons labeled `Window` and `Content Area`.
+10. `Window` is the default value.
+11. `Window` mode applies the selected dimensions to the complete outer window.
+12. `Content Area` mode automatically compensates for title bar/borders so `GetClientRect()` matches the selected resolution.
+13. Content-area compensation is measured dynamically and is not based on hard-coded title-bar/border sizes.
+14. Resize results are measured and verified.
+15. Invalid/closed HWNDs are handled safely.
+16. Minimized/maximized windows are verified as restored to normal state before resizing; minimized windows are verified as un-minimized before foreground activation.
+17. DPI scaling is handled correctly.
+18. Win32 failures are reported meaningfully.
+19. External-window behavior is isolated in a reusable service rather than being embedded in UI handlers.
+20. No resize logic is duplicated between the `Set Resolution` button and resolution double-click handling.
+21. Add, Edit, and Delete manage the resolution list through the supplied dialog for Add/Edit.
+22. The resolution list persists in `application_settings.json`, including an intentionally empty list.
+23. An empty window list or empty resolution list prevents resizing.
+24. The `Apply resolution to:` radio selection and light/dark theme choice persist in `application_settings.json`; no window, resolution, or filter selection is saved.
+25. Duplicate resolutions are rejected by exact ordered width/height pair, while swapped dimensions remain distinct.
+26. Resolutions sort by width, then height, in ascending numeric order.
+27. Duplicate HWNDs are removed from the window list while distinct HWNDs remain visible even when process name, title, and PID match.
+28. Window entries sort alphabetically by process name, then by numeric PID.
+29. The main window follows `001_MainWindowV2.png` with Windows list, Resolutions, and Diagnostics group boxes, while retaining the status bar.
+30. The window filter provides gray placeholder text, case-insensitive process/title filtering, a brush clear button, and a refresh icon with tooltip `Refresh window list`.
+31. Resolution actions use icon-only plus, pen, and trashcan buttons with matching tooltips.
+32. The Set Resolution button shows an action icon above its text; the Add/Edit dialog follows `002_ResolutionAddEditWindowV2.png` with a Resolution group box and large numeric inputs.
+33. The app has no native frame or native control box; its in-app header contains working minimize, maximize/restore, and close controls.
+34. The borderless app can be dragged by its header and resized from its edges and corners, with a minimum size of 760 x 560.
+35. During a native border drag, the ImGui viewport and Direct3D swapchain grow with the Win32 client rectangle so the panels visibly reflow and newly exposed pixels do not remain black. Live redraw must also meet the idle CPU requirement below.
+36. The Set Resolution button spans the resolution panel's available content width, leaving matching left and right margins.
+37. The `Apply resolution to:` label and both mode options share one line, and each option has a visible ring and selected dot.
+38. The refresh button's right edge aligns with the window-list box, and its icon is a readable three-arrow recycle symbol.
+39. The bottom-right moon/sun button switches light/dark theme immediately, saves `DarkMode`, and restores it on the next launch.
+40. `WindowResizer.ico` supplies the executable icon and the running window's large and small Windows icons.
+41. With the window open and no user input, the app does not keep a CPU core busy. Measure idle CPU over several seconds on the target machine; local samples of the low-CPU build were below 1% of total CPU on a 12 logical processor machine, including after live resize redraw was added.
+
+---
+
+## 17. Exact implementation and project layout
+
+This section describes the implemented copy, including changes made after the V2 PNGs. It takes precedence over any older visual detail in the images. Use the PNGs for overall visual proportions and the Add/Edit dialog; use the measurements and behavior below for the final version.
+
+```text
+WindowResizer/WindowResizer.csproj       desktop app
+WindowResizer/Program.cs                SDL/Veldrid main loop and ImGui UI
+WindowResizer/BorderlessChrome.cs       SDL hit testing for dragging/resizing
+WindowResizer/ResizeRedrawHook.cs       live redraw during native border drag
+WindowResizer/WindowIcon.cs             large/small native window icon setup
+WindowResizer/NativeMethods.cs          user32 P/Invoke declarations
+WindowResizer/ExternalWindowService.cs  enumeration, state, foreground, resize
+WindowResizer/SettingsStore.cs          settings models and JSON persistence
+WindowResizer/DoubleClickTracker.cs     deterministic row double-click detection
+WindowResizer/AssemblyInfo.cs           exposes internals to checks
+WindowResizer/app.manifest               DPI awareness and asInvoker
+WindowResizer.Checks/                   console checks using a temporary WinForms window
+001_MainWindowV2.png                    original layout reference
+002_ResolutionAddEditWindowV2.png       dialog reference
+WindowResizer.ico                       multi-size application icon
+```
+
+Use a Windows executable (`OutputType=WinExe`) targeting `net8.0-windows`, with nullable reference types, implicit usings, and unsafe code enabled. Set `<ApplicationIcon>..\WindowResizer.ico</ApplicationIcon>` in the app project so the icon is embedded in the generated executable. Pin these NuGet packages so the same APIs and visuals are available:
+
+```text
+ImGui.NET                 1.89.2
+Veldrid.ImGui             5.89.2-ga121087cad
+Veldrid.StartupUtilities  4.9.0
+```
+
+Use Veldrid's SDL2 window backend and Direct3D11 renderer. Do not replace the interface with WinForms, WPF, native Win32 controls, a browser, or a native Windows frame. The checks project targets `net8.0-windows`, uses Windows Forms only to create a temporary test target, and references the desktop project. The app assembly exposes internal members to `WindowResizer.Checks` with `InternalsVisibleTo`.
+
+The manifest requests `asInvoker`, `uiAccess=false`, and `PerMonitorV2,PerMonitor` DPI awareness. No elevation prompt should be requested.
+
+Build on Windows with:
+
+```powershell
+dotnet build .\WindowResizer\WindowResizer.csproj -c Release
+dotnet run --project .\WindowResizer.Checks\WindowResizer.Checks.csproj
+```
+
+The Release executable is `WindowResizer/bin/Release/net8.0-windows/WindowResizer.exe`. If it is running, Windows locks that path; close it before replacing the executable, or build to a separate output folder.
+
+## 18. Main window, custom chrome, resize handling, and idle CPU
+
+Create an SDL2 window titled `Window Resizer` at screen position (80, 60) with initial client size 1180 x 860. Use `OpenGL | Resizable | Shown | Borderless` SDL flags and `threadedProcessing: false`. Extract both large and small HICONs from the generated executable with `ExtractIconExW`, send `WM_SETICON` with `ICON_BIG` and `ICON_SMALL` to the SDL window's HWND, keep the handles alive until the window closes, and release them with `DestroyIcon`. This makes the supplied `WindowResizer.ico` appear on the executable and running window/taskbar. Graphics creation explicitly selects `GraphicsBackend.Direct3D11`. Add an `ImGuiRenderer` for the swapchain output and draw one root ImGui window at `(0, 0)` with the current client size every rendered frame. Give it `NoDecoration | NoMove | NoResize | NoSavedSettings`. Do not render a native title bar or native system buttons.
+
+Draw `Window Resizer` at the upper left of the root window. At the upper right, draw three transparent 40 x 28 ImGui buttons with 4-unit gaps: minimize (horizontal line), maximize/restore (square or overlapping squares according to `IsZoomed`), and close (X). The three buttons occupy 128 units at the right side of the in-app header. Make close hover/active red; make the other hover/active colors blue gray. Clicking minimize calls `ShowWindow(mainHwnd, SW_MINIMIZE)`. Clicking maximize toggles `SW_MAXIMIZE` and `SW_RESTORE` based on `IsZoomed`. Clicking close exits the render loop and closes the SDL window. Tooltips are `Minimize`, `Maximize`/`Restore`, and `Close`.
+
+Because the window has no native frame, register an SDL hit-test callback. A 7-unit strip at every edge and corner resizes the window while it is not maximized. The first 46 units of height, except the rightmost 164 units reserved for the header buttons, is draggable. Return normal hit testing over the buttons and elsewhere. Disable resize grips when maximized. Set the SDL minimum window size to 760 x 560. Keep the callback delegate alive for the full window lifetime. Do not turn on Veldrid's built-in threaded processing to obtain live redraw: in this pinned version it was observed to keep one thread consuming roughly a full CPU core while idle. The `threadedProcessing` choice is fixed when `Sdl2Window` is constructed; its `LimitPollRate` setting still used about 9% total CPU in a local idle sample and is not an effective substitute.
+
+Avoid black uncovered areas during and after a size change: in every render iteration, call Win32 `GetClientRect(mainHwnd)` rather than relying only on SDL's cached width/height. When the measured client size changes, resize `graphics.MainSwapchain` and call `renderer.WindowResized(width, height)` before drawing. Skip rendering while either dimension is zero (for example during minimization), and clear the entire current framebuffer each frame before rendering ImGui. Use `(0.93, 0.95, 0.97, 1)` in light mode and `(.17, .17, .23, 1)` in dark mode for the clear color. Use `graphics.SwapBuffers` each frame.
+
+### Exact live resize implementation
+
+The CPU fix and the live resize fix must coexist. Keep `threadedProcessing: false`; do not create, suspend, resume, or switch an SDL event thread when a drag starts. The pinned `Sdl2Window` stores that constructor choice in a read-only field. A test with `threadedProcessing: true`, `LimitPollRate = true`, and `PollIntervalInMs = 16` still used about 4.17 CPU seconds in 4 wall seconds on a 12 logical processor machine (about 9% total CPU). The limit internally yields with `Thread.Sleep(0)` and did not make idle polling cheap in this environment.
+
+Windows runs a modal move/resize loop during an SDL border drag. `window.PumpEvents()` on the UI thread may not return until the mouse is released, but the HWND still receives `WM_SIZE`. After the graphics device, command list, ImGui renderer, and app state are ready, install `ResizeRedrawHook` on that HWND. The hook must use `SetWindowSubclass`, `DefSubclassProc`, and `RemoveWindowSubclass` from `comctl32.dll` with a retained `UnmanagedFunctionPointer(CallingConvention.Winapi)` delegate. Use a stable, nonzero subclass ID (the reference uses `0x5752`). Install and remove it on the same thread that owns the SDL window, and remove it before the window is destroyed.
+
+The callback state machine is:
+
+```text
+WM_ENTERSIZEMOVE (0x0231): mark inSizeMove = true
+all messages:                call DefSubclassProc first
+WM_SIZE (0x0005):          if inSizeMove, request a redraw, throttled to at most 30 FPS
+WM_EXITSIZEMOVE (0x0232):  mark inSizeMove = false; force one final redraw
+```
+
+For each callback redraw, call `GetClientRect(mainHwnd)` and render only if both dimensions are positive. Throttle with `Stopwatch.GetTimestamp()` / `Stopwatch.GetElapsedTime()`; do not start an always-running timer. Keep a `_redrawing` guard in the hook and a `rendering` guard in the shared render function to prevent nested ImGui or Direct3D work. Catch exceptions before returning across the native callback boundary; the reference writes the exception to `Debug` and stops callback redraw for that drag. Keep the delegate alive until `RemoveWindowSubclass` returns.
+
+Use one `RenderFrame(InputSnapshot input, int width, int height)` function for the normal loop and the resize callback. It computes real elapsed delta time, resizes the Direct3D swapchain and calls `renderer.WindowResized` when the client size differs from the last rendered size, then calls `renderer.Update`, `app.Draw`, command-list begin/clear/render/end, `graphics.SubmitCommands`, and `graphics.SwapBuffers` in that order. During the callback, pass a singleton empty `InputSnapshot`: empty key, mouse, and character event lists; zero wheel delta; `IsMouseDown` false; and mouse position `(-1, -1)`. Do not call `window.PumpEvents()` recursively from `WM_SIZE`, and do not replay the preceding input snapshot, since that could repeat clicks or typed characters. The normal loop still calls `window.PumpEvents()` before `RenderFrame` and handles app chrome actions afterward.
+
+Install the hook with a `using` lifetime inside the renderer scope, before entering the main loop. Its disposal must precede `window.Close()`. This keeps SDL, ImGui, and Direct3D calls on the window-owning UI thread while allowing redraws inside the Windows modal loop. `ResizeRedrawHook.cs` and `Program.cs` contain the reference implementation.
+
+### Idle CPU findings and rebuild rules
+
+ImGui is immediate mode: `renderer.Update`, all list rows and controls, command submission, and `SwapBuffers` run again for every rendered frame even when the displayed data has not changed. Cache the external window enumeration and refresh it only at startup or when the user clicks Refresh. The resolution list comes from settings and changes only through Add/Edit/Delete. Do not put `EnumWindows`, settings reads, or file writes in the render loop.
+
+The prior build used `threadedProcessing: true`, disabled vertical sync in `GraphicsDeviceOptions`, and rendered without a frame limit. A local idle sample on a 12 logical processor Windows machine consumed 9.7 CPU seconds over 4 wall seconds, about 20% total CPU. Enabling vertical sync alone reduced that sample to 4.4 CPU seconds (about 9%); adding a 30 FPS cap had little further effect. Per-thread sampling then found one thread using nearly a full core. Changing only SDL window creation to `threadedProcessing: false` reduced the sample to 0.22 CPU seconds over 4 wall seconds (about 0.5%). These figures are measurements on one machine, not universal targets, but they identify the built-in threaded SDL event pump as the dominant idle cost in this pinned Veldrid setup.
+
+For the reference implementation, use `threadedProcessing: false`, set the third `GraphicsDeviceOptions` constructor argument (`syncToVerticalBlank`) to `true`, and pace the loop to at most 30 rendered frames per second with a `Stopwatch` and a sleep for the remaining frame interval. Keep delta time based on real elapsed time, including the sleep. Vertical sync and frame pacing reduce redundant redraws; neither fixes a separate event thread that spins. A future event-driven renderer is fine if it wakes promptly for input, text editing, tooltips, window resize, and close, and its idle CPU is measured.
+
+### What changed and how to verify it
+
+| Prior behavior or problem | Implemented change |
+|---|---|
+| The window used `threadedProcessing: true`; its SDL event thread kept a CPU core busy while idle. | Construct `Sdl2Window` with `threadedProcessing: false`. |
+| Vertical sync was off and the ImGui render loop had no pacing. | Set `syncToVerticalBlank: true` in `GraphicsDeviceOptions` and sleep for any remainder of a 1/30 second frame interval. |
+| Non-threaded event pumping paused ImGui drawing during a native border drag. | `ResizeRedrawHook` draws from `WM_SIZE` during the modal drag and forces a final frame on `WM_EXITSIZEMOVE`. |
+| A second rendering path could diverge or repeat input. | Normal and callback frames use the same guarded `RenderFrame`; callback frames use `NoInputSnapshot`. |
+
+Measure a running idle process after startup for at least several seconds. Compute `(CPU time after - CPU time before) / (wall seconds * logical processor count)` to compare with Task Manager's total CPU percentage. Sample individual thread CPU times if usage stays high. The original build used about 20% total CPU in the local 12 logical processor sample; the version with the live resize hook used 0.42 CPU seconds over 4 wall seconds in a Release build, about 0.9% total CPU. These values vary by machine and display setup; verify the absence of a continuously busy thread rather than requiring exactly 0.0%.
+
+To verify live resize, start the app on a Windows desktop and drag an edge slowly while keeping the mouse button pressed. Confirm that the client width and the two panels change before release, with no persistent black uncovered strip; then release and confirm the final frame, input, and controls work. One check grew the outer window from 1180 to 1380 pixels and captured the UI before mouse release: the panel widths had reflowed. Repeat with shrinking, a corner drag, maximized/restored states, and both themes when rebuilding from scratch. Also test filtering, typing, double-clicks, popups, theme changes, and minimize/restore after any event-loop change. The automated `WindowResizer.Checks` project covers data and Win32 sizing behavior, but does not test idle CPU or visual redraw during a native drag.
+
+Load `segoeui.ttf` from the Windows Fonts folder when present. Use 18-unit text for the normal UI and 38-unit text for the dialog's numeric inputs; recreate the ImGui font device texture after loading. If the font is unavailable, use ImGui's default font. Set root rounding 0, child rounding 5, frame rounding 5, frame padding `(10, 7)`, item spacing `(9, 9)`, and root window padding `(18, 16)` in both themes. For light mode, start from `ImGui.StyleColorsLight()` and set root background RGBA `(0.94, 0.96, 0.98, 1)`, white child backgrounds, button RGBA `(0.81, 0.88, 0.97, 1)`, button hover `(0.68, 0.80, 0.96, 1)`, and button active `(0.54, 0.71, 0.94, 1)`. Dark overrides are in Section 22.
+
+Under the header separator, place the Windows list panel on the left and Resolutions panel on the right, with ImGui's 9-unit horizontal spacing. Their common height is `max(180, availableHeight - diagnosticsHeight - 60)`, leaving room for the bottom-right theme button. The left panel width is `max(250, availableWidth * 0.52)` and the right width is `max(240, availableWidth - leftWidth - style.ItemSpacing.X)`. Put a full-width Diagnostics panel below them with height `clamp(availableHeight * 0.27, 155, 270)`, then a separator and one-line status text. Each panel is an ImGui child with a visible border, title text, and separator. The Windows list and resolution rows are separate bordered, scrollable child controls. The Diagnostics child contains a bordered log child.
+
+## 19. Precise panel controls and visual alignment
+
+The Windows list panel begins with `Windows list`, a separator, then one horizontal row containing a placeholder input (`Filter`), a brush button, and a recycle-style refresh button. Each icon button is 34 x 31. Compute filter width from the actual content width minus `2 * 34 + 2 * style.ItemSpacing.X`; this makes the right edge of refresh line up with the right edge of the bordered window rows. Do not use the older 74-unit reservation, which makes refresh protrude. Draw the brush as a dark diagonal handle and small triangular bristles. Draw the refresh symbol as three separate clockwise arrow arcs around the button center rather than the old almost-closed single circle. For a close reconstruction, use arcs at angles `[-2.8, -1.0]`, `[-0.7, 1.1]`, and `[1.4, 3.2]` radians with radius 8, ten line segments each, stroke width 2.2, and a filled arrowhead at each arc end. Keep `Clear filter` and `Refresh window list` tooltips.
+
+The Resolutions panel begins with `Resolutions`, a separator, and icon-only plus, pen, and trash buttons, each 34 x 31 with tooltips. The resolution rows occupy `max(80, remaining panel height - 160)`. After the bordered list, put the exact label `Apply resolution to:` on the same horizontal line as `Window` and `Content Area`. Use two mutually exclusive radio-style options with full option click targets. Each has a white 20-unit-diameter circle, a 2-unit dark blue-gray border (about RGB 0.24/0.36/0.49), and a 5.5-unit-radius blue dot (about RGB 0.16/0.46/0.88) when selected. The circle must remain visibly outlined even when selected. Put its label 7 units to the right, vertically centered. Space the label and options by 16 units. The options save the selected mode immediately.
+
+Below that row place the pale blue `Set Resolution` button. It is 64 units high and uses **all** of the panel's current content width (`GetContentRegionAvail().X`), giving it the same left and right margin as the resolution list box. Do not cap it at 330 units. Center an eight-spoke gear/action icon at about 19 units from its top and center `Set Resolution` text at about 38 units from its top. Disable the button unless a visible external window and a resolution are selected, but keep defensive validation in its command.
+
+Add/Edit is a non-resizable modal popup titled `Add/Edit Resolution`, initially 500 x 280. Its bordered `Resolution` section is 135 units high and contains the width input, an `x` separator, and the height input; the input names are internal IDs rather than visible labels. Each text input is 145 units wide, uses the 38-unit font, accepts decimal characters, and has adjacent `+`/`-` small buttons. Default Add to 800 x 600; populate Edit from the selected entry. Put Cancel and Save at the lower right, each 98 x 36. Show validation errors in red and keep the modal open. On valid Save, normalize, save, and select the new or edited resolution. Cancel leaves data unchanged.
+
+## 20. State, interaction, and diagnostics details
+
+Use separate selected values for the window's actual `HWND` and the `ResolutionInfo(width, height)` value. In each ImGui list, use one `Selectable` per row, so only one item can be selected. Maintain a separate `DoubleClickTracker<T>` for each list. It stores the last clicked item, mouse position, and monotonic `Stopwatch` tick. The second left click activates only if it has the same item, is within `GetDoubleClickTime()`, and is within 12 pixels of the prior click (`distanceSquared <= 144`). Reset the click pair after activation. A window-list double-click calls `BringSelectedToFront`; a resolution-list double-click calls the same `ApplySelectedResolution` method as the button.
+
+For external windows, `EnumWindows` returns visible top-level handles. Exclude the current process by PID, remove duplicate HWNDs, retain distinct windows from one process, and sort by case-insensitive process name, numeric PID, title, then handle. Trim titles and show `process - title - pid - HWND 0x...`, or omit the title segment if blank. Search only process name and title with case-insensitive substring matching. When a filter or refresh hides the selected HWND, clear its selection. Validate a retained handle with `IsWindow`, and confirm its current PID still equals the PID captured during enumeration before any action.
+
+Bring-to-front checks for a minimized target, calls `SW_RESTORE` if needed, then verifies it is no longer iconic. It calls both `BringWindowToTop` and `SetForegroundWindow`, logs their results, and reports a foreground activation denial without crashing. Before any resize, restore a minimized or maximized target to normal with up to three `SW_RESTORE` calls and verify with both `IsIconic` and `IsZoomed`. Then measure current dimensions, apply the selected mode, measure final dimensions, and log actual versus requested sizes if the target restricts resizing. `SetWindowPos` uses `SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE` for sizing. In Content Area mode, compensate using measured outer minus client dimensions and correct up to three times; do not use a fixed border allowance. A stale or reused HWND must not cause a resize of an unrelated process.
+
+Keep the lower status line initialized to `Ready`. Clicking a window updates it to `Selected <process> (<HWND>)`; successful resize updates it to `Applied <resolution> to <process>`. Log entries are prefixed with local `[HH:mm:ss]`, kept to the newest 300 lines, and the Diagnostics child scrolls to the bottom when already near it. Log settings load, list refresh, mode changes, resolution edits/deletes, double-click activation, target identity, measurements, native resize results, and failures. The log is session-only.
+
+Persist settings in `application_settings.json` beside the executable (`AppContext.BaseDirectory`), using indented JSON with `Resolutions`, `ApplyMode`, and `DarkMode`. `ResolutionInfo` serializes as objects with `Width` and `Height`; the default `System.Text.Json` enum representation is numeric (`0` for Window, `1` for ContentArea). `DarkMode` is a boolean, defaulting to `false` both on first launch and when older settings omit the field. On later launches retain an intentionally empty saved list, discard invalid dimensions and duplicate ordered pairs, and sort width then height. Write via a `.tmp` file and replace/move it over the settings file. Save on startup after load, on every mode or theme change, and after Add/Edit/Delete. Do not persist selection, filter, status, or diagnostics. If settings cannot be read or saved, report the error in Diagnostics without crashing.
+
+## 21. Regression checks for this implemented copy
+
+Run the `WindowResizer.Checks` console project. Its checks cover first-launch defaults, settings normalization and empty-list persistence, radio-mode persistence, double-click timing and identity, borderless header hit testing, corner resize hit testing, no maximized resize grip, own-window exclusion, duplicate HWND removal, restoring minimized/maximized targets, bring-to-front restoration, and exact outer/client sizing on a temporary Windows Forms window. Verify the visual details on a running Windows desktop as well: custom controls replace the native controls, panels visibly reflow during a native border drag with no black uncovered strip, the Set Resolution button has equal side margins, the mode label/options share one line with outlined radio rings and a pronounced selected dot, and the refresh button is flush with the list's right edge and has three readable arrows. Measure idle CPU as described in Section 18 and confirm that no thread spins while the UI is unchanged. The reference implementation uses `threadedProcessing: false` plus a Win32 resize callback to provide both live redraw and low idle CPU.
+
+## 22. Light and dark themes
+
+Start in the existing light palette when no `DarkMode` value is saved. Put a compact 30 x 27 theme button at the bottom right of the status line, aligned with the right content margin. In light mode draw a dark crescent/half-moon icon and show the tooltip `Switch to dark mode`. In dark mode draw a warm yellow sun (central filled circle with eight rays) and show `Switch to light mode`. Clicking toggles the theme immediately, saves `DarkMode` to JSON, and logs `Theme: Dark` or `Theme: Light`. Restore the saved theme before the first rendered frame. The toggle is available whether or not a target window or resolution is selected.
+
+For the dark palette use the attached ImHex UI as the visual reference: near-black content panels and list backgrounds, a muted purple-charcoal outer surface, soft gray borders, light readable text, and violet selected rows and controls. Start from `ImGui.StyleColorsDark()` and set approximately: `WindowBg=(.17,.17,.23)`, `ChildBg=(.055,.06,.08)`, `PopupBg=(.11,.12,.17)`, `Text=(.91,.92,.97)`, `Border=(.34,.35,.45)`, `FrameBg=(.19,.20,.27)`, `Button=(.28,.29,.43)`, `ButtonHovered=(.38,.39,.58)`, `ButtonActive=(.45,.45,.67)`, `Header=(.38,.37,.68)`, `HeaderHovered=(.34,.35,.53)`, and `Separator=(.34,.35,.46)`, with full alpha. Use a dark swapchain clear color matching the outer surface. Tint scrollbars and the check mark in the same violet family. Keep the existing light palette unchanged when toggling back by resetting ImGui to `StyleColorsLight()` before applying its overrides.
+
+The custom maximize/minimize hover colors should also darken in dark mode. Radio option circles must remain readable: use a lighter border, the dark frame background as fill, and a pale violet selected dot. Use the same functional layout, icons, labels, tooltips, and actions in both themes. Update the checks to cover dark and light persistence and loading an older JSON file without `DarkMode`.
+
+## 23. Local repository layout
+
+Keep the source and both PNG references in one Git repository rooted at the code location. The current branch is `main`. The local bare `origin` is `.local-origin.git` inside that directory and is excluded from version control. Ignore `bin/`, `obj/`, Visual Studio local files, `application_settings.json`, and `imgui.ini`. Commit source, this specification, the README, the manifest, and both reference PNGs. Do not commit generated executables or user settings.

@@ -1,0 +1,13 @@
+# Build and IDE output
+**/bin/
+**/obj/
+.vs/
+*.user
+*.suo
+
+# Runtime state
+application_settings.json
+imgui.ini
+
+# Local push destination
+.local-origin.git/
